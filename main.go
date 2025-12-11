@@ -11,28 +11,28 @@ import (
 )
 
 func main() {
-	f, err := os.Open("./data/bremen-latest.osm.pbf")
+	file, err := os.Open("./data/bremen-latest.osm.pbf")
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	defer f.Close()
+	defer file.Close()
 
-	d := osmpbf.NewDecoder(f)
+	decoder := osmpbf.NewDecoder(file)
 
-	d.SetBufferSize(osmpbf.MaxBlobSize)
+	decoder.SetBufferSize(osmpbf.MaxBlobSize)
 
-	err = d.Start(runtime.GOMAXPROCS(-1))
+	err = decoder.Start(runtime.GOMAXPROCS(-1))
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	var nc, wc, rc uint64
+	var nodeCount, wayCount, relCount uint64
 
 	var nodes []OsmNodePosition
 
 	for {
-		if v, err := d.Decode(); err == io.EOF {
+		if v, err := decoder.Decode(); err == io.EOF {
 			break
 		} else if err != nil {
 			log.Fatal(err)
@@ -41,20 +41,20 @@ func main() {
 			case *osmpbf.Node:
 				item := OsmNodePosition{v.ID, int32(v.Lat * 10000000), int32(v.Lon * 10000000)}
 				nodes = append(nodes, item)
-				nc++
+				nodeCount++
 			case *osmpbf.Way:
 
-				wc++
+				wayCount++
 			case *osmpbf.Relation:
 
-				rc++
+				relCount++
 			default:
 				log.Fatalf("unknown type %T\n", v)
 			}
 		}
 	}
 
-	fmt.Printf("Nodes: %d, Ways: %d, Relations: %d\n", nc, wc, rc)
+	fmt.Printf("Nodes: %d, Ways: %d, Relations: %d\n", nodeCount, wayCount, relCount)
 	fmt.Printf("Structs in nodes slice: %d\n", len(nodes))
 }
 
