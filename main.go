@@ -43,7 +43,6 @@ func main() {
 				nodes = append(nodes, item)
 				nodeCount++
 			case *osmpbf.Way:
-
 				wayCount++
 			case *osmpbf.Relation:
 
@@ -55,8 +54,16 @@ func main() {
 	}
 
 	fmt.Printf("Nodes: %d, Ways: %d, Relations: %d\n", nodeCount, wayCount, relCount)
-	fmt.Printf("Structs in nodes slice: %d\n", len(nodes))
 }
+
+/*
+	1. [ ] implement String Interning (string store)
+	2. [ ] sort/filter node tags an only save relevant ones.
+	3.
+
+
+
+*/
 
 type OsmNodePosition struct {
 	Id  int64
