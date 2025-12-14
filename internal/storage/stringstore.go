@@ -2,8 +2,16 @@ package storage
 
 import (
 	"encoding/binary"
+	"fmt"
+	"hash/fnv"
+	"io"
 	"os"
 	"syscall"
+)
+
+const (
+	StringHeaderSize      = 8
+	StringIndexHeaderSize = 8
 )
 
 type StringStoreRecord struct {
@@ -12,124 +20,114 @@ type StringStoreRecord struct {
 }
 
 type StringStore struct {
+	Data  []byte
+	File  *os.File
+	Index StringIndexStore
+	Hash  map[uint64][]uint32 // [hashed str => slice of str ids] - temporary map for dedup check during import
+}
+
+type StringIndexStore struct {
 	Data []byte
 	File *os.File
 }
 
-type LookupIndex struct {
-	id     uint32
-	offset int
-}
-
-func CreateStringStore() *StringStore {
-	f, err := os.OpenFile("test.dat", os.O_RDWR|os.O_CREATE, 0644)
+func CreateStringStore() (*StringStore, error) {
+	f, err := os.OpenFile("strings.bin", os.O_RDWR|os.O_CREATE, 0644)
 	if err != nil {
 		panic(err)
 	}
-
-	f.Truncate(1024)
-
-	defer func(f *os.File) {
-		err := f.Close()
-		if err != nil {
-			panic(err)
-		}
-	}(f)
+	err = f.Truncate(1024)
+	if err != nil {
+		panic(err)
+	}
 
 	fd := int(f.Fd())
-
-	data, err := syscall.Mmap(
-		fd,
-		0,
-		1024,
-		syscall.PROT_READ|syscall.PROT_WRITE,
-		syscall.MAP_SHARED,
-	)
+	data, err := syscall.Mmap(fd, 0, 1024, syscall.PROT_READ|syscall.PROT_WRITE, syscall.MAP_SHARED)
 	if err != nil {
 		panic(err)
 	}
 
-	defer func(b []byte) {
-		err := syscall.Munmap(b)
-		if err != nil {
-			panic(err)
-		}
-	}(data)
+	// initialize the write-offset header
+	ensureHeaderInit(data, StringHeaderSize)
 
-	// we reserve the first 8 bytes for storing current offset.
-	currentOffseet := 8
+	index, err := CreateStringIndex()
+	if err != nil {
+		panic(err)
+	}
 
-	return &StringStore{data, f}
-
-	// 5. Daten manipulieren (als Bytes)
-	// Hier schreiben wir "Go" an den Anfang
-	//copy(data, []byte("Go is fast"))
-
-	// 6. Der "Unsafe" Cast (Das wolltest du lernen)
-	// Hier tun wir so, als wären die Bytes ein int32 (oder dein NodeStruct)
-	// Achtung: Das hier ist Pointer-Arithmetic.
-	//ptr := unsafe.Pointer(&data[0])
-
-	// Sagen wir, die ersten 4 Bytes sind ein Int32
-	//intVal := (*int32)(ptr)
-	//*intVal = 99999 // Wir schreiben direkt in den Speicher/Datei
-
-	//fmt.Println("Daten geschrieben via Mmap!")
+	return &StringStore{
+		Data:  data,
+		File:  f,
+		Index: *index,
+		Hash:  map[uint64][]uint32{},
+	}, nil
 }
 
-func PutString(target *string, buf []byte) uint32 {
-	offset := getCurrentStartingOffset(buf)
-	strLen := uint32(len(*target))
-	// write the str length encoded in 4 bytes to the start of the buf
-	binary.LittleEndian.PutUint32(buf[offset:], strLen)
-
-	return 1
+func (s *StringStore) Close() error {
+	if err := syscall.Munmap(s.Data); err != nil {
+		return err
+	}
+	return s.File.Close()
 }
 
-func putStringTest(target *string, store *StringStore) {
+func (s *StringStore) Put(target string) uint32 {
+	startOffset := readHeaderOffset(s.Data)
+	// 1. hash string
+	hash := hashString(target)
+	// 2. check if hash exists: if yes, 3.a if no, 3.b
+	if s.Hash[hash] != nil {
+		// if the hash already exists
+		fmt.Println("!!! Duplicate hash found, not supported yet.")
 
-	// first we have to get the offset for the first byte that is 'free' so empty.
-	// maybe there is a method that declares the length of the used space in the buf/file, would be ideal
-	// otherwise we have to iterate & jump linear
-	//offset := 0
+		// ------------------------------------------------------
+		// s.Hash ist deine map[uint64][]uint32
+		// hash ist dein uint64 Key
+		// newID ist die uint32 ID, die du gerade generiert hast
+		//s.Hash[hash] = append(s.Hash[hash], newID)
+		// ------------------------------------------------------
 
-	// get teh 32bit length of the target, so 4 byte as a prefix for the store entry.
-	//strLen := uint32(len(target))
+		// next: get value of hash key, iterate through the ids to get the string binaries and decode them.
+		// loop through, check if a string matches an existing one with strict equality
+		// if so, return its id.
+		// if no strings match, continue writing that string, but add the id to that exact hashes slice.
+	}
+	s.write(target)
+	// append offset to index slice
+	binary.LittleEndian.PutUint64(s.Index.Data, startOffset)
+	// 7. take that write offset and put it in indexes slice
+	// 8. return id of str reccord
 
-	// Structure of each 'record' in StringStore
-	// Str Length uint32	 	Unique ID uint32	value of str len in bytes, individual
-	// [] [] [] []				[] [] [] []			strLen * []
-
-	return 1
+	return 12
 }
 
-// StringStoreRecordHeaderSizeInBytes 4 = only StrLen, 8 = StrLen + id
-const StringStoreRecordHeaderSizeInBytes = 4
+func (s *StringStore) write(target string) {
+	writeOffset := readHeaderOffset(s.Data)
+	strLen := uint32(len(target))
 
-// BufHeaderSizeInBytes header stores the current offset, so where data ends.
-const BufHeaderSizeInBytes = 8
+	// 5. write str binary (copy) at write offset pos
+	copy(s.Data[writeOffset:], target)
+	// 6. increment write offset by strlen in buf header
+	incrementHeaderOffset(s.Data, uint64(strLen))
 
-func getCurrentStartingOffset(buf []byte) int {
-	// todo: read header from buf and return that decoded uint32
-	return BufHeaderSizeInBytes
-}
-func nextOffset(currentOffset int, buf []byte) int {
-	strLen := binary.LittleEndian.Uint32(buf[currentOffset : currentOffset+4])
-	return currentOffset + StringStoreRecordHeaderSizeInBytes + int(strLen)
 }
 
-func GetOffsetForId(Id int, lookupStore *[]LookupIndex) int {
-	// TODO
-	// look in the index after id and return the offset
-	return 8
+func (s *StringStore) Get(id uint32) string {
+	// 1. nimm index[id] und hole offset
+	// 2. check if last item in index, wenn nein, -> a, wenn ja, -> b
+	// 3.a increase die id+1 und hole dir diesen offset, dann subtrahieren und wir haben die str len
+	// 3.b subtract id offset from store header write offset to get str len
+	// 4. decode string binaries and return
+
+	return "test"
 }
 
-func GetStringById(id uint32, buf []byte) string {
-	// todo: check lookup table to
-	recordOffset := int(BufHeaderSizeInBytes + 0)
-	return DecodeStringFromRecordOffset(recordOffset, buf)
+func hashString(s string) uint64 {
+	h := fnv.New64a()
+	_, _ = io.WriteString(h, s)
+	return h.Sum64()
 }
 
+/*
 func DecodeStringFromRecordOffset(recordOffset int, buf []byte) string {
 	decodedStrLen := binary.LittleEndian.Uint32(buf[recordOffset:])
 	strStartOffset := recordOffset + StringStoreRecordHeaderSizeInBytes
@@ -137,12 +135,4 @@ func DecodeStringFromRecordOffset(recordOffset int, buf []byte) string {
 	decodedStr := string(rawStringBytes)
 
 	return decodedStr
-}
-
-/*
-Index lookup table bauen mit id und offset
-erste 8 bytes vom buff reservieren für offset zum schreiben
-method bauen zum auslesen des aktuellen offsets ab dem die daten leer sind (wo neuer record reinkommt)
-update method bauen wo einfach nur geupdated wird die länge und eine str length geparsed wird, header wird von der const hinzufegügt
-dann write funktion und read funktion
-*/
+}*/
