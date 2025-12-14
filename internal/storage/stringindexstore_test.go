@@ -1,16 +1,28 @@
 package storage
 
 import (
+	"path/filepath"
 	"testing"
 )
 
 func TestStringIndexStore(t *testing.T) {
-	indexStore, err := CreateStringIndex()
+
+	tmpDir := t.TempDir()
+	testFilePath := filepath.Join(tmpDir, "test_string_index_store.bin")
+
+	indexStore, err := CreateStringIndex(testFilePath)
 	if err != nil {
 		panic(err)
 	}
 
-	testId := 694
+	t.Cleanup(func() {
+		err := indexStore.Close()
+		if err != nil {
+			t.Logf("Error closing store: %v", err)
+		}
+	})
+
+	testId := uint64(694)
 
 	headerOffsetBeforeInsert := readHeaderOffset(indexStore.Data)
 	if headerOffsetBeforeInsert != 8 {
@@ -18,7 +30,7 @@ func TestStringIndexStore(t *testing.T) {
 		t.Fail()
 	}
 
-	indexStore.Put(uint64(testId))
+	indexStore.Put(testId)
 
 	headerOffsetAfterInsert := readHeaderOffset(indexStore.Data)
 	if headerOffsetAfterInsert != 16 {
@@ -41,12 +53,4 @@ func TestStringIndexStore(t *testing.T) {
 		t.Log("Header Offset is not 32 AFTER insert of third item")
 		t.Fail()
 	}
-
-	err = indexStore.Close()
-	if err != nil {
-		panic(err)
-	}
-
-	//fmt.Println(thirdOffset)
-	//fmt.Println(indexStore.Data)
 }

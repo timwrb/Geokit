@@ -6,8 +6,8 @@ import (
 	"syscall"
 )
 
-func CreateStringIndex() (*StringIndexStore, error) {
-	f, err := os.OpenFile("string_indexes.bin", os.O_RDWR|os.O_CREATE, 0644)
+func CreateStringIndex(filename string) (*StringIndexStore, error) {
+	f, err := os.OpenFile(filename, os.O_RDWR|os.O_CREATE, 0644)
 	if err != nil {
 		panic(err)
 	}

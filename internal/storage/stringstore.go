@@ -31,8 +31,8 @@ type StringIndexStore struct {
 	File *os.File
 }
 
-func CreateStringStore() (*StringStore, error) {
-	f, err := os.OpenFile("strings.bin", os.O_RDWR|os.O_CREATE, 0644)
+func CreateStringStore(filename string) (*StringStore, error) {
+	f, err := os.OpenFile(filename, os.O_RDWR|os.O_CREATE, 0644)
 	if err != nil {
 		panic(err)
 	}
@@ -50,7 +50,7 @@ func CreateStringStore() (*StringStore, error) {
 	// initialize the write-offset header
 	ensureHeaderInit(data, StringHeaderSize)
 
-	index, err := CreateStringIndex()
+	index, err := CreateStringIndex("string_indexes.bin")
 	if err != nil {
 		panic(err)
 	}
