@@ -16,7 +16,9 @@ func main() {
 		log.Fatal(err)
 	}
 
-	defer file.Close()
+	defer func(file *os.File) {
+		_ = file.Close()
+	}(file)
 
 	decoder := osmpbf.NewDecoder(file)
 
@@ -39,6 +41,7 @@ func main() {
 		} else {
 			switch v := v.(type) {
 			case *osmpbf.Node:
+
 				item := OsmNodePosition{v.ID, int32(v.Lat * 10000000), int32(v.Lon * 10000000)}
 				nodes = append(nodes, item)
 				nodeCount++

@@ -1,8 +1,6 @@
 package storage
 
 import (
-	"encoding/binary"
-	"fmt"
 	"hash/fnv"
 	"io"
 	"os"
@@ -14,35 +12,35 @@ const (
 	StringIndexHeaderSize = 8
 )
 
-type StringStoreRecord struct {
-	id  uint32
-	str string
-}
-
 type StringStore struct {
 	Data  []byte
 	File  *os.File
-	Index StringIndexStore
+	Index *StringIndexStore
 	Hash  map[uint64][]uint32 // [hashed str => slice of str ids] - temporary map for dedup check during import
 }
 
-type StringIndexStore struct {
-	Data []byte
-	File *os.File
-}
-
-func CreateStringStore(filename string) (*StringStore, error) {
+func CreateStringStore(filename string, indexStore *StringIndexStore, initFileSizeInBytes int64) (*StringStore, error) {
 	f, err := os.OpenFile(filename, os.O_RDWR|os.O_CREATE, 0644)
 	if err != nil {
 		panic(err)
 	}
-	err = f.Truncate(1024)
+
+	fileInfo, err := f.Stat()
 	if err != nil {
 		panic(err)
 	}
 
+	fileSize := fileInfo.Size()
+
+	if fileSize == 0 {
+		fileSize = initFileSizeInBytes
+		if err := f.Truncate(fileSize); err != nil {
+			panic(err)
+		}
+	}
+
 	fd := int(f.Fd())
-	data, err := syscall.Mmap(fd, 0, 1024, syscall.PROT_READ|syscall.PROT_WRITE, syscall.MAP_SHARED)
+	data, err := syscall.Mmap(fd, 0, int(fileSize), syscall.PROT_READ|syscall.PROT_WRITE, syscall.MAP_SHARED)
 	if err != nil {
 		panic(err)
 	}
@@ -50,15 +48,10 @@ func CreateStringStore(filename string) (*StringStore, error) {
 	// initialize the write-offset header
 	ensureHeaderInit(data, StringHeaderSize)
 
-	index, err := CreateStringIndex("string_indexes.bin")
-	if err != nil {
-		panic(err)
-	}
-
 	return &StringStore{
 		Data:  data,
 		File:  f,
-		Index: *index,
+		Index: indexStore,
 		Hash:  map[uint64][]uint32{},
 	}, nil
 }
@@ -70,69 +63,111 @@ func (s *StringStore) Close() error {
 	return s.File.Close()
 }
 
-func (s *StringStore) Put(target string) uint32 {
-	startOffset := readHeaderOffset(s.Data)
-	// 1. hash string
-	hash := hashString(target)
-	// 2. check if hash exists: if yes, 3.a if no, 3.b
-	if s.Hash[hash] != nil {
-		// if the hash already exists
-		fmt.Println("!!! Duplicate hash found, not supported yet.")
-
-		// ------------------------------------------------------
-		// s.Hash ist deine map[uint64][]uint32
-		// hash ist dein uint64 Key
-		// newID ist die uint32 ID, die du gerade generiert hast
-		//s.Hash[hash] = append(s.Hash[hash], newID)
-		// ------------------------------------------------------
-
-		// next: get value of hash key, iterate through the ids to get the string binaries and decode them.
-		// loop through, check if a string matches an existing one with strict equality
-		// if so, return its id.
-		// if no strings match, continue writing that string, but add the id to that exact hashes slice.
+// Intern this will write or return an existing string's id/index in the mmap
+func (s *StringStore) Intern(target string) uint32 {
+	// early return if target already exists in store
+	possiblyExistingStringId, match, stringHash := s.Lookup(target)
+	if match == true {
+		return possiblyExistingStringId
 	}
-	s.write(target)
-	// append offset to index slice
-	binary.LittleEndian.PutUint64(s.Index.Data, startOffset)
-	// 7. take that write offset and put it in indexes slice
-	// 8. return id of str reccord
 
-	return 12
-}
+	// Calculate based on index offset formula 8n+8
+	newId := uint32((readHeaderOffset(s.Index.Data) - 8) / 8)
+	startOffset := readHeaderOffset(s.Data)
 
-func (s *StringStore) write(target string) {
-	writeOffset := readHeaderOffset(s.Data)
+	// write hash & newId into hash store,
+	s.Hash[stringHash] = append(s.Hash[stringHash], newId)
+
 	strLen := uint32(len(target))
 
-	// 5. write str binary (copy) at write offset pos
+	// String binaries get appended onto the Mmap file
+	s.write(target, strLen)
+
+	// New starting offset gets written into the Index Store
+	// The newId will mathematically be the index (key) of the startOffset (value)
+	s.Index.Put(startOffset)
+
+	return newId
+}
+
+// Lookup returns id, bool if match or not, and the created hash of the string
+func (s *StringStore) Lookup(target string) (uint32, bool, uint64) {
+	hash := hashString(target)
+	stringIds := s.Hash[hash]
+	stringIdsLen := len(stringIds)
+
+	// when s.Hash[hash] is nil, len will be 0, therefore does target not exist in the store yet
+	if stringIdsLen == 0 {
+		return 0, false, hash
+	}
+
+	for _, id := range stringIds {
+		resolvedString := s.Get(id)
+		if resolvedString == target {
+			return id, true, hash
+		}
+	}
+
+	return 0, false, hash
+}
+
+func (s *StringStore) write(target string, length uint32) {
+	writeOffset := readHeaderOffset(s.Data)
+	requiredSpace := writeOffset + uint64(length)
+
+	if requiredSpace > uint64(len(s.Data)) {
+		s.resize(requiredSpace)
+	}
+
 	copy(s.Data[writeOffset:], target)
-	// 6. increment write offset by strlen in buf header
-	incrementHeaderOffset(s.Data, uint64(strLen))
-
+	incrementHeaderOffset(s.Data, uint64(length))
 }
 
-func (s *StringStore) Get(id uint32) string {
-	// 1. nimm index[id] und hole offset
-	// 2. check if last item in index, wenn nein, -> a, wenn ja, -> b
-	// 3.a increase die id+1 und hole dir diesen offset, dann subtrahieren und wir haben die str len
-	// 3.b subtract id offset from store header write offset to get str len
-	// 4. decode string binaries and return
+func (s *StringStore) Get(targetId uint32) string {
+	// Get Start offset of the string in the Index Store
+	offsetStart := s.Index.Get(targetId)
+	offsetEnd := s.Index.Get(targetId + 1)
 
-	return "test"
+	if offsetEnd == 0 {
+		offsetEnd = readHeaderOffset(s.Data)
+	}
+
+	return string(s.Data[offsetStart:offsetEnd])
 }
 
-func hashString(s string) uint64 {
+func (s *StringStore) resize(neededCapacity uint64) {
+	currentSize := uint64(len(s.Data))
+
+	newSize := currentSize * 2
+
+	if newSize < neededCapacity {
+		newSize = neededCapacity
+	}
+
+	err := syscall.Munmap(s.Data)
+	if err != nil {
+		panic(err)
+	}
+
+	err = s.File.Truncate(int64(newSize))
+	if err != nil {
+		panic(err)
+	}
+
+	fd := int(s.File.Fd())
+	data, err := syscall.Mmap(fd, 0, int(newSize), syscall.PROT_READ|syscall.PROT_WRITE, syscall.MAP_SHARED)
+	if err != nil {
+		panic(err)
+	}
+
+	s.Data = data
+}
+
+// We use a Closure here to be able to mock hashes in tests more easily
+// e.g. hash collisions, when 2 distinct strings generate the same hash
+// we want to assure that the store can handle this edge case
+var hashString = func(s string) uint64 {
 	h := fnv.New64a()
 	_, _ = io.WriteString(h, s)
 	return h.Sum64()
 }
-
-/*
-func DecodeStringFromRecordOffset(recordOffset int, buf []byte) string {
-	decodedStrLen := binary.LittleEndian.Uint32(buf[recordOffset:])
-	strStartOffset := recordOffset + StringStoreRecordHeaderSizeInBytes
-	rawStringBytes := buf[strStartOffset : strStartOffset+int(decodedStrLen)]
-	decodedStr := string(rawStringBytes)
-
-	return decodedStr
-}*/
